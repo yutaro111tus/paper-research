@@ -73,6 +73,7 @@ function renderResult(data) {
         <h3>${querySummary.originalQuery || '検索テーマ'}</h3>
         <p><strong>分野:</strong> ${querySummary.detectedField || '自動判定'}</p>
         <p><strong>検索期間:</strong> ${querySummary.searchPeriod?.from || '-'} - ${querySummary.searchPeriod?.to || '-'}</p>
+        <p class="muted">${querySummary.modelSummary || 'モデル要約はまだありません。'}</p>
       </div>
       <div class="result-card">
         <span class="tag">Foundational Papers</span>
