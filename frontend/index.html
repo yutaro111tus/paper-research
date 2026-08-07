@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Research Trend Explorer</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero">
+        <div class="hero-badge">Research Trend Explorer</div>
+        <h1>研究テーマから、文献の入口を整理する</h1>
+        <p class="hero-copy">
+          基礎文献・研究潮流・代表研究を、信頼性を重視して一目で確認できます。
+        </p>
+      </header>
+
+      <main class="content-card">
+        <section class="panel intro-panel">
+          <div>
+            <h2>研究テーマを入力</h2>
+            <p>日本語・英語のキーワードを入れて、関連する研究の入口を探索できます。</p>
+          </div>
+          <form id="search-form" class="search-form">
+            <label for="query">研究テーマ</label>
+            <input id="query" name="query" type="text" placeholder="例: generative AI in education" required />
+
+            <label for="field">研究分野</label>
+            <select id="field" name="field">
+              <option value="自動判定">自動判定</option>
+              <option value="経済学・経営学">経済学・経営学</option>
+              <option value="社会科学">社会科学</option>
+              <option value="工学">工学</option>
+              <option value="情報科学">情報科学</option>
+              <option value="環境科学">環境科学</option>
+              <option value="医学・生命科学">医学・生命科学</option>
+              <option value="人文科学">人文科学</option>
+              <option value="その他">その他</option>
+            </select>
+
+            <button type="submit">研究テーマを探索</button>
+          </form>
+        </section>
+
+        <section id="status-panel" class="status-panel" aria-live="polite"></section>
+        <section id="result-panel" class="result-panel"></section>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
