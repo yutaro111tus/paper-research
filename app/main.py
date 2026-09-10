@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import json
@@ -16,7 +16,7 @@ from openai import OpenAI
 
 
 # ============================================================
-# 基本設定
+# Paths / environment
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -25,9 +25,33 @@ ENV_FILE = BASE_DIR / ".env"
 
 load_dotenv(ENV_FILE)
 
+
+# ============================================================
+# JSON response
+# ============================================================
+
+class SafeJSONResponse(JSONResponse):
+    """
+    Serialize non-ASCII characters as ¥¥uXXXX.
+    This makes the actual HTTP JSON payload ASCII-only and avoids
+    browser/terminal charset problems while JSON clients still receive
+    the correct Unicode values after parsing.
+    """
+    media_type = "application/json; charset=utf-8"
+
+    def render(self, content) -> bytes:
+        return json.dumps(
+            content,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+
 app = FastAPI(
     title="Research Trend Explorer",
     version="0.1.0",
+    default_response_class=SafeJSONResponse,
 )
 
 app.mount(
@@ -38,18 +62,16 @@ app.mount(
 
 
 # ============================================================
-# Request / Response
+# Request / response models
 # ============================================================
 
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
     field: Optional[str] = None
-
     foundationalCount: int = 3
     trendCount: int = 5
     papersPerTrend: int = 3
     recentYears: int = 5
-
     languages: List[str] = ["ja", "en"]
     publicationTypes: List[str] = ["article"]
 
@@ -61,60 +83,50 @@ class SearchStatusResponse(BaseModel):
     error: Optional[str] = None
 
 
-# ============================================================
-# 検索結果保存
-# ============================================================
-
 search_store: dict[str, dict] = {}
 
 
 # ============================================================
-# OpenAI設定
+# OpenAI settings
 # ============================================================
 
-# 通常用。現状では主に表示用。
 MODEL_NAME = os.getenv(
     "OPENAI_MODEL",
     "gpt-5-nano",
 )
 
-# Web検索用
 SEARCH_MODEL_NAME = os.getenv(
     "OPENAI_SEARCH_MODEL",
     "gpt-5.6-luna",
 )
 
-# テスト中は3～4程度で十分
 MAX_WEB_SEARCH_CALLS = int(
     os.getenv(
         "OPENAI_MAX_WEB_SEARCH_CALLS",
-        "4",
+        "3",
     )
 )
 
 
 # ============================================================
-# OpenAI Client
+# OpenAI client
 # ============================================================
 
 def get_openai_api_key() -> Optional[str]:
-
     value = os.getenv(
         "OPENAI_API_KEY",
         "",
     ).strip()
-
     return value or None
 
 
 def get_openai_client() -> OpenAI:
-
     api_key = get_openai_api_key()
 
     if not api_key:
         raise RuntimeError(
-            "OPENAI_API_KEY が設定されていません。"
-            ".env に OPENAI_API_KEY を設定してください。"
+            "OPENAI_API_KEY is not configured. "
+            "Set OPENAI_API_KEY in your .env file."
         )
 
     return OpenAI(
@@ -125,7 +137,30 @@ def get_openai_client() -> OpenAI:
 
 
 # ============================================================
-# JSON Schema
+# Input normalization
+# ============================================================
+
+FIELD_MAP = {
+    "自動判定": "Auto-detect",
+    "経済学・経営学": "Economics and Management",
+    "社会科学": "Social Sciences",
+    "工学": "Engineering",
+    "情報科学": "Computer and Information Science",
+    "環境科学": "Environmental Science",
+    "医学・生命科学": "Medicine and Life Sciences",
+    "人文科学": "Humanities",
+    "その他": "Other",
+}
+
+
+def normalize_field(field: Optional[str]) -> str:
+    if not field:
+        return "Auto-detect"
+    return FIELD_MAP.get(field, field)
+
+
+# ============================================================
+# Structured Output JSON schema
 # ============================================================
 
 def build_output_schema(
@@ -138,12 +173,8 @@ def build_output_schema(
     source_schema = {
         "type": "object",
         "properties": {
-            "title": {
-                "type": "string"
-            },
-            "url": {
-                "type": "string"
-            },
+            "title": {"type": "string"},
+            "url": {"type": "string"},
             "sourceType": {
                 "type": "string",
                 "enum": [
@@ -172,62 +203,53 @@ def build_output_schema(
         "type": "object",
         "properties": {
             "title": {
-                "type": "string"
+                "type": "string",
+                "minLength": 1,
             },
-
-            # nullは禁止
-            # 最低1名の著者が必要
             "authors": {
                 "type": "array",
                 "items": {
-                    "type": "string"
+                    "type": "string",
+                    "minLength": 1,
                 },
                 "minItems": 1,
             },
-
             "year": {
                 "type": "integer",
                 "minimum": 1800,
                 "maximum": current_year,
             },
-
             "venue": {
-                "type": "string"
+                "type": "string",
+                "minLength": 1,
             },
-
             "publicationType": {
-                "type": "string"
+                "type": "string",
             },
-
             "doi": {
                 "type": [
                     "string",
                     "null",
-                ]
+                ],
             },
-
-            "abstractJa": {
-                "type": "string"
+            "abstract": {
+                "type": "string",
             },
-
             "publisherUrl": {
                 "type": [
                     "string",
                     "null",
-                ]
+                ],
             },
-
             "importanceReason": {
-                "type": "string"
+                "type": "string",
             },
-
             "sources": {
                 "type": "array",
                 "items": source_schema,
                 "minItems": 1,
             },
         },
-
         "required": [
             "title",
             "authors",
@@ -235,50 +257,40 @@ def build_output_schema(
             "venue",
             "publicationType",
             "doi",
-            "abstractJa",
+            "abstract",
             "publisherUrl",
             "importanceReason",
             "sources",
         ],
-
         "additionalProperties": False,
     }
 
     trend_schema = {
         "type": "object",
         "properties": {
-            "nameJa": {
-                "type": "string"
+            "name": {
+                "type": "string",
             },
-
-            "nameEn": {
-                "type": "string"
-            },
-
             "description": {
-                "type": "string"
+                "type": "string",
             },
-
             "whyImportantNow": {
-                "type": "string"
+                "type": "string",
             },
-
             "researchQuestions": {
                 "type": "array",
                 "items": {
-                    "type": "string"
+                    "type": "string",
                 },
                 "maxItems": 5,
             },
-
             "keywords": {
                 "type": "array",
                 "items": {
-                    "type": "string"
+                    "type": "string",
                 },
                 "maxItems": 10,
             },
-
             "maturity": {
                 "type": "string",
                 "enum": [
@@ -287,17 +299,14 @@ def build_output_schema(
                     "Established",
                 ],
             },
-
             "papers": {
                 "type": "array",
                 "items": paper_schema,
                 "maxItems": papers_per_trend,
             },
         },
-
         "required": [
-            "nameJa",
-            "nameEn",
+            "name",
             "description",
             "whyImportantNow",
             "researchQuestions",
@@ -305,71 +314,52 @@ def build_output_schema(
             "maturity",
             "papers",
         ],
-
         "additionalProperties": False,
     }
 
     return {
         "type": "object",
-
         "properties": {
             "normalizedTopic": {
-                "type": "string"
+                "type": "string",
             },
-
-            "keywordsJa": {
+            "keywords": {
                 "type": "array",
                 "items": {
-                    "type": "string"
+                    "type": "string",
                 },
-                "maxItems": 10,
+                "maxItems": 12,
             },
-
-            "keywordsEn": {
-                "type": "array",
-                "items": {
-                    "type": "string"
-                },
-                "maxItems": 10,
-            },
-
             "detectedField": {
-                "type": "string"
+                "type": "string",
             },
-
             "modelSummary": {
-                "type": "string"
+                "type": "string",
             },
-
             "foundationalPapers": {
                 "type": "array",
                 "items": paper_schema,
                 "maxItems": foundational_count,
             },
-
             "researchTrends": {
                 "type": "array",
                 "items": trend_schema,
                 "maxItems": trend_count,
             },
-
             "sources": {
                 "type": "array",
                 "items": source_schema,
             },
-
             "warnings": {
                 "type": "array",
                 "items": {
-                    "type": "string"
+                    "type": "string",
                 },
             },
         },
-
         "required": [
             "normalizedTopic",
-            "keywordsJa",
-            "keywordsEn",
+            "keywords",
             "detectedField",
             "modelSummary",
             "foundationalPapers",
@@ -377,108 +367,51 @@ def build_output_schema(
             "sources",
             "warnings",
         ],
-
         "additionalProperties": False,
     }
 
 
 # ============================================================
-# Google Scholar URL
+# Paper helpers
 # ============================================================
 
-def make_google_scholar_url(
-    title: str,
-) -> str:
-
-    title = title or ""
-
-    query = f'"{title}"'
-
+def make_google_scholar_url(title: str) -> str:
+    query = f'"{title or ""}"'
     return (
         "https://scholar.google.com/scholar?q="
         + quote_plus(query)
     )
 
 
-# ============================================================
-# Citation Key
-# ============================================================
-
-def make_citation_key(
-    paper: dict,
-) -> str:
-
-    authors = paper.get(
-        "authors"
-    ) or []
-
-    # --------------------------------------------------------
-    # Noneや空文字が混入していても落ちない
-    # --------------------------------------------------------
-
-    valid_authors = []
-
-    for author in authors:
-
-        if not isinstance(
-            author,
-            str,
-        ):
-            continue
-
-        author = author.strip()
-
-        if not author:
-            continue
-
-        valid_authors.append(
-            author
-        )
-
-    if valid_authors:
-
-        first_author = (
-            valid_authors[0]
-        )
-
-        parts = (
-            first_author.split()
-        )
-
-        surname = (
-            parts[-1]
-            if parts
-            else "unknown"
-        )
-
-    else:
-
-        surname = "unknown"
-
-    surname = re.sub(
-        r"[^A-Za-z0-9]",
+def safe_ascii_key(text: str) -> str:
+    return re.sub(
+        r"[^a-z0-9]+",
         "",
-        surname,
-    ).lower()
-
-    if not surname:
-        surname = "unknown"
-
-    year = paper.get(
-        "year"
+        (text or "").lower(),
     )
 
-    if not year:
-        year = "nd"
 
-    title = paper.get(
-        "title"
+def make_citation_key(paper: dict) -> str:
+    authors = paper.get("authors") or []
+
+    first_author = next(
+        (
+            author.strip()
+            for author in authors
+            if isinstance(author, str)
+            and author.strip()
+        ),
+        "unknown",
     )
 
-    if not isinstance(
-        title,
-        str,
-    ):
+    parts = first_author.split()
+    surname = parts[-1] if parts else "unknown"
+    surname = safe_ascii_key(surname) or "unknown"
+
+    year = paper.get("year") or "nd"
+
+    title = paper.get("title")
+    if not isinstance(title, str):
         title = ""
 
     words = re.findall(
@@ -506,259 +439,127 @@ def make_citation_key(
         "are",
     }
 
-    keyword = "paper"
-
-    for word in words:
-
-        if word not in stopwords:
-
-            keyword = word
-            break
-
-    return (
-        f"{surname}"
-        f"{year}"
-        f"{keyword}"
+    keyword = next(
+        (
+            word
+            for word in words
+            if word not in stopwords
+        ),
+        "paper",
     )
 
+    return f"{surname}{year}{keyword}"
 
-# ============================================================
-# BibTeX
-# ============================================================
 
-def make_bibtex(
-    paper: dict,
-) -> str:
-
-    key = make_citation_key(
-        paper
-    )
-
-    # Noneがあっても落ちない
-    valid_authors = []
-
-    for author in (
-        paper.get("authors")
-        or []
-    ):
-
-        if not isinstance(
-            author,
-            str,
-        ):
-            continue
-
-        author = author.strip()
-
-        if not author:
-            continue
-
-        valid_authors.append(
-            author
-        )
-
-    authors_text = (
-        " and ".join(
-            valid_authors
-        )
-    )
-
-    title = (
-        paper.get("title")
-        or ""
-    )
-
-    year = (
-        paper.get("year")
-        or ""
-    )
-
-    venue = (
-        paper.get("venue")
-        or ""
-    )
-
-    doi = paper.get(
-        "doi"
-    )
-
-    lines = [
-        f"@article{{{key},",
-        f"  title = {{{title}}},",
-        f"  author = {{{authors_text}}},",
-        f"  year = {{{year}}},",
-        f"  journal = {{{venue}}},",
+def make_bibtex(paper: dict) -> str:
+    authors = [
+        author.strip()
+        for author in (paper.get("authors") or [])
+        if isinstance(author, str)
+        and author.strip()
     ]
 
-    if doi:
+    lines = [
+        f"@article{{{make_citation_key(paper)},",
+        f"  title = {{{paper.get('title') or ''}}},",
+        f"  author = {{{' and '.join(authors)}}},",
+        f"  year = {{{paper.get('year') or ''}}},",
+        f"  journal = {{{paper.get('venue') or ''}}},",
+    ]
 
+    doi = paper.get("doi")
+    if doi:
         lines.append(
             f"  doi = {{{doi}}},"
         )
 
-    lines.append(
-        "}"
-    )
+    lines.append("}")
 
-    return "\n".join(
-        lines
-    )
+    return "¥n".join(lines)
 
 
-# ============================================================
-# 文献の最低限検証
-# ============================================================
-
-def is_valid_paper(
-    paper: dict,
-) -> bool:
-
-    if not isinstance(
-        paper,
-        dict,
-    ):
+def is_valid_paper(paper: dict) -> bool:
+    if not isinstance(paper, dict):
         return False
 
-    title = paper.get(
-        "title"
-    )
-
-    if not isinstance(
-        title,
-        str,
-    ):
+    title = paper.get("title")
+    if not isinstance(title, str) or not title.strip():
         return False
 
-    if not title.strip():
-        return False
-
-    authors = paper.get(
-        "authors"
-    )
-
-    if not isinstance(
-        authors,
-        list,
-    ):
+    authors = paper.get("authors") or []
+    if not isinstance(authors, list):
         return False
 
     valid_authors = [
-        author.strip()
+        author
         for author in authors
         if isinstance(author, str)
         and author.strip()
     ]
 
-    # 著者が確認できない文献は採用しない
     if not valid_authors:
         return False
 
-    year = paper.get(
-        "year"
-    )
-
-    if not isinstance(
-        year,
-        int,
-    ):
+    year = paper.get("year")
+    if not isinstance(year, int):
         return False
 
-    venue = paper.get(
-        "venue"
-    )
-
-    if not isinstance(
-        venue,
-        str,
-    ):
+    venue = paper.get("venue")
+    if not isinstance(venue, str) or not venue.strip():
         return False
 
-    if not venue.strip():
+    sources = paper.get("sources") or []
+    if not isinstance(sources, list):
         return False
 
-    sources = paper.get(
-        "sources"
-    )
-
-    if not isinstance(
-        sources,
-        list,
-    ):
-        return False
-
-    valid_sources = []
+    valid_source_found = False
 
     for source in sources:
-
-        if not isinstance(
-            source,
-            dict,
-        ):
+        if not isinstance(source, dict):
             continue
 
-        url = source.get(
-            "url"
-        )
+        url = source.get("url")
 
         if (
             isinstance(url, str)
             and url.startswith(
                 (
-                    "http://",
                     "https://",
+                    "http://",
                 )
             )
         ):
+            valid_source_found = True
+            break
 
-            valid_sources.append(
-                source
-            )
+    return valid_source_found
 
-    # Web確認元が存在しない文献も採用しない
-    if not valid_sources:
-        return False
-
-    return True
-
-
-# ============================================================
-# 文献追加情報
-# ============================================================
 
 def enrich_paper(
     paper: dict,
     category: str,
 ) -> Optional[dict]:
 
-    if not is_valid_paper(
-        paper
-    ):
+    if not is_valid_paper(paper):
         return None
 
-    paper = dict(
-        paper
-    )
+    paper = dict(paper)
 
-    # authorsを念のため正規化
     paper["authors"] = [
         author.strip()
-        for author in (
-            paper.get("authors")
-            or []
-        )
-        if isinstance(
-            author,
-            str,
-        )
+        for author in paper.get("authors", [])
+        if isinstance(author, str)
         and author.strip()
     ]
 
-    paper["id"] = str(
-        uuid.uuid4()
-    )
+    paper["id"] = str(uuid.uuid4())
+    paper["category"] = category
 
-    paper["category"] = (
-        category
+    # Keep both names for compatibility with the existing frontend.
+    paper["abstractJa"] = (
+        paper.get("abstract")
+        or
+        "No publicly available abstract was verified."
     )
 
     paper["googleScholarUrl"] = (
@@ -770,74 +571,43 @@ def enrich_paper(
         )
     )
 
-    paper["bibtex"] = (
-        make_bibtex(
-            paper
-        )
+    paper["bibtex"] = make_bibtex(
+        paper
     )
 
     doi_exists = bool(
-        paper.get(
-            "doi"
-        )
+        paper.get("doi")
     )
 
     publisher_exists = bool(
-        paper.get(
-            "publisherUrl"
-        )
+        paper.get("publisherUrl")
     )
 
-    abstract = (
-        paper.get(
-            "abstractJa"
-        )
+    abstract_text = (
+        paper.get("abstract")
         or ""
     ).strip()
 
-    abstract_exists = (
-        bool(abstract)
-        and abstract
+    abstract_exists = bool(
+        abstract_text
+        and abstract_text
         !=
-        "公開されている概要を確認できませんでした"
+        "No publicly available abstract was verified."
     )
 
-    # Web sourceがあり、最低限の書誌情報あり
-    verification_status = (
+    paper["verificationStatus"] = (
         "verified"
     )
 
-    paper[
-        "verificationStatus"
-    ] = verification_status
-
-    paper[
-        "verification"
-    ] = {
-
-        "status":
-            verification_status,
-
-        "titleMatched":
-            True,
-
-        "authorsMatched":
-            True,
-
-        "yearMatched":
-            True,
-
-        "venueMatched":
-            True,
-
-        "doiMatched":
-            doi_exists,
-
-        "publisherPageFound":
-            publisher_exists,
-
-        "abstractFound":
-            abstract_exists,
+    paper["verification"] = {
+        "status": "verified",
+        "titleMatched": True,
+        "authorsMatched": True,
+        "yearMatched": True,
+        "venueMatched": True,
+        "doiMatched": doi_exists,
+        "publisherPageFound": publisher_exists,
+        "abstractFound": abstract_exists,
     }
 
     return paper
@@ -852,21 +622,14 @@ def deduplicate_sources(
 ) -> list:
 
     result = []
-
     seen_urls = set()
 
     for source in sources:
-
-        if not isinstance(
-            source,
-            dict,
-        ):
+        if not isinstance(source, dict):
             continue
 
         url = (
-            source.get(
-                "url"
-            )
+            source.get("url")
             or ""
         ).strip()
 
@@ -876,25 +639,22 @@ def deduplicate_sources(
         if url in seen_urls:
             continue
 
-        seen_urls.add(
-            url
-        )
+        seen_urls.add(url)
+
+        source_title = source.get("title") or "Source"
+        if not isinstance(source_title, str) or not source_title.isascii():
+            source_title = "Source"
 
         result.append(
             {
                 "title":
-                    source.get(
-                        "title"
-                    )
-                    or url,
+                    source_title,
 
                 "url":
                     url,
 
                 "sourceType":
-                    source.get(
-                        "sourceType"
-                    )
+                    source.get("sourceType")
                     or "other",
             }
         )
@@ -902,39 +662,22 @@ def deduplicate_sources(
     return result
 
 
-# ============================================================
-# OpenAI Web Search Sources
-# ============================================================
-
 def extract_web_search_sources(
     response,
 ) -> list:
 
     try:
-
-        payload = (
-            response.model_dump()
-        )
-
+        payload = response.model_dump()
     except Exception:
-
         return []
 
     sources = []
 
-    output_items = (
-        payload.get(
-            "output"
-        )
+    for item in (
+        payload.get("output")
         or []
-    )
-
-    for item in output_items:
-
-        if not isinstance(
-            item,
-            dict,
-        ):
+    ):
+        if not isinstance(item, dict):
             continue
 
         if (
@@ -945,32 +688,18 @@ def extract_web_search_sources(
             continue
 
         action = (
-            item.get(
-                "action"
-            )
+            item.get("action")
             or {}
         )
 
-        action_sources = (
-            action.get(
-                "sources"
-            )
-            or []
-        )
-
         for source in (
-            action_sources
+            action.get("sources")
+            or []
         ):
-
-            if not isinstance(
-                source,
-                dict,
-            ):
+            if not isinstance(source, dict):
                 continue
 
-            url = source.get(
-                "url"
-            )
+            url = source.get("url")
 
             if not url:
                 continue
@@ -978,10 +707,7 @@ def extract_web_search_sources(
             sources.append(
                 {
                     "title":
-                        source.get(
-                            "title"
-                        )
-                        or url,
+                        "Web source",
 
                     "url":
                         url,
@@ -997,16 +723,14 @@ def extract_web_search_sources(
 
 
 # ============================================================
-# OpenAI検索
+# OpenAI research
 # ============================================================
 
 def research_topic(
     request: SearchRequest,
 ) -> dict:
 
-    client = (
-        get_openai_client()
-    )
+    client = get_openai_client()
 
     now = (
         datetime
@@ -1014,9 +738,7 @@ def research_topic(
         .astimezone()
     )
 
-    current_year = (
-        now.year
-    )
+    current_year = now.year
 
     foundational_count = max(
         1,
@@ -1052,316 +774,209 @@ def research_topic(
 
     from_year = (
         current_year
-        -
-        recent_years
-        +
-        1
+        - recent_years
+        + 1
     )
 
-    schema = (
-        build_output_schema(
-            foundational_count,
-            trend_count,
-            papers_per_trend,
-            current_year,
-        )
+    field = normalize_field(
+        request.field
+    )
+
+    schema = build_output_schema(
+        foundational_count,
+        trend_count,
+        papers_per_trend,
+        current_year,
     )
 
     prompt = f"""
-あなたは研究者向け文献調査アシスタントです。
+You are a research literature discovery assistant.
 
-研究テーマ:
+USER QUERY:
 {request.query}
 
-ユーザー指定研究分野:
-{request.field or "自動判定"}
+USER-SPECIFIED FIELD:
+{field}
 
-設定:
-基礎・著名文献:
-最大 {foundational_count} 件
+SETTINGS:
+- Foundational papers: up to {foundational_count}
+- Research trends: up to {trend_count}
+- Representative papers per trend: up to {papers_per_trend}
+- Recent research period: {from_year}-{current_year}
 
-研究潮流:
-最大 {trend_count} 件
+Use web search to investigate the topic.
 
-各研究潮流の代表文献:
-最大 {papers_per_trend} 件
+OUTPUT LANGUAGE RULE:
+EVERY human-readable text field in your JSON response MUST be in English.
 
-最近の研究の対象期間:
-{from_year}年から{current_year}年
+This includes:
+- normalizedTopic
+- keywords
+- detectedField
+- modelSummary
+- trend names
+- trend descriptions
+- research questions
+- importance explanations
+- warnings
+- source titles
 
-文献言語:
-{", ".join(request.languages)}
+The user query may be Japanese or another language.
+Translate and normalize it internally, but return the topic in English.
 
-文献タイプ:
-{", ".join(request.publicationTypes)}
+PAPER LANGUAGE RULE:
+Prefer papers with an official English bibliographic title.
+If a paper has no verifiable English bibliographic title, exclude it.
+Do not translate a paper title yourself.
 
+BIBLIOGRAPHIC ACCURACY:
+Only return papers whose existence you verified on the web.
 
-必ずWeb検索を使用して調査してください。
+Never invent or infer:
+- paper title
+- authors
+- publication year
+- journal/conference/publisher
+- DOI
+- paper URL
 
+Authors are mandatory.
+If you cannot verify at least one author, exclude the paper.
+Never return an empty authors array.
 
-【文献情報に関する最重要ルール】
-
-実在をWeb上で確認できた学術文献だけを返してください。
-
-特に以下を確認してください。
-
-- タイトル
-- 著者
-- 出版年
-- 掲載誌・学会・出版社
-- DOI（存在する場合）
-- 文献ページURL
-
-著者名を確認できない文献は、
-結果に含めないでください。
-
-著者を null にしてはいけません。
-
-著者を推測してはいけません。
-
-authors は必ず、
-Web上で確認できた実在する著者名を
-1名以上含む文字列配列にしてください。
-
-例:
-
-"authors": [
-    "John Smith",
-    "Jane Doe"
-]
-
-以下は禁止です。
-
-"authors": [null]
-
-"authors": []
-
-"authors": [""]
-
-タイトル、
-著者、
-出版年、
-掲載誌、
-DOI、
-URLを推測で生成してはいけません。
-
-DOIを確認できない場合だけ、
-doiをnullにしてください。
-
-架空のDOIを作らないでください。
-
-
-【情報源】
-
-可能な限り以下を優先してください。
-
-- 出版社公式ページ
-- DOI公式ページ
+Use authoritative sources when possible:
+- official publisher page
+- DOI page
 - Crossref
 - PubMed
 - arXiv
 - SSRN
 - RePEc
-- 学会公式ページ
-- 大学・研究機関リポジトリ
+- conference website
+- university or research institute repository
 
-各文献のsourcesには、
-その書誌情報の確認に実際に使用したページを
-最低1件入れてください。
+DOI:
+If a DOI cannot be verified, use null.
+Never fabricate a DOI.
 
+ABSTRACT:
+If you can verify a publicly available abstract, summarize it faithfully
+in concise English.
 
-【Abstract】
+If no public abstract can be verified, set abstract exactly to:
 
-公開abstractを確認できた場合のみ、
-そのabstractに忠実な日本語要約を
-abstractJaに書いてください。
+"No publicly available abstract was verified."
 
-abstractを確認できなかった場合は、
+Do not infer an abstract from the title.
 
-「公開されている概要を確認できませんでした」
+FOUNDATIONAL PAPERS:
+Do not restrict foundational papers to {from_year}-{current_year}.
+Choose papers that are genuinely useful for understanding the formation,
+standard theories, standard methods, or key concepts of the field.
+Do not simply choose recent papers.
 
-としてください。
+RESEARCH TRENDS:
+Use mainly literature from {from_year}-{current_year}.
+Identify genuine recurring research themes rather than isolated buzzwords.
+Use recent reviews, major journals, conferences, and relevant policy or
+societal developments where useful.
 
-タイトルだけから内容を推測してはいけません。
+Maturity must be one of:
+- Emerging
+- Growing
+- Established
 
+MODEL SUMMARY:
+Write a concise 100-180 word English overview of the research topic.
 
-【基礎文献】
+SOURCES:
+Each paper must have at least one real web source used to verify its
+bibliographic information.
 
-基礎文献は
-{from_year}年以降に限定しないでください。
-
-研究分野を理解するうえで、
-
-- 分野形成に影響した文献
-- 標準的な理論
-- 標準的方法
-- 代表的な概念
-- 後続研究で重要な文献
-
-を優先してください。
-
-単に最近出版されたという理由で
-基礎文献にしないでください。
-
-
-【研究潮流】
-
-主として
-{from_year}年から{current_year}年
-の研究を調査してください。
-
-最近のレビュー論文、
-主要ジャーナル、
-国際会議、
-政策動向、
-研究量、
-学術的重要性、
-社会的重要性
-などを参考にしてください。
-
-単なる流行キーワードではなく、
-複数研究に共通する研究課題として整理してください。
-
-maturity は、
-
-Emerging
-Growing
-Established
-
-のいずれかにしてください。
-
-
-【言語】
-
-説明は日本語で書いてください。
-
-論文タイトル、
-著者、
-ジャーナル名、
-学会名、
-出版社名
-は原語表記を維持してください。
-
-
-【modelSummary】
-
-検索テーマそのものについて、
-研究者向けに
-150〜300字程度の日本語で説明してください。
-
-
-【重要】
-
-指定件数を満たすために、
-確認できない文献を生成してはいけません。
-
-条件を満たす文献が少ない場合は、
-確認できた件数だけ返してください。
+If fewer verified papers are available than requested, return fewer papers.
+Accuracy is more important than filling quotas.
 """
 
-    response = (
-        client.responses.create(
+    response = client.responses.create(
+        model=SEARCH_MODEL_NAME,
+        input=prompt,
 
-            model=
-                SEARCH_MODEL_NAME,
+        tools=[
+            {
+                "type":
+                    "web_search"
+            }
+        ],
 
-            input=
-                prompt,
+        tool_choice="auto",
 
-            tools=[
-                {
-                    "type":
-                        "web_search"
-                }
-            ],
+        max_tool_calls=
+            MAX_WEB_SEARCH_CALLS,
 
-            tool_choice=
-                "auto",
+        include=[
+            "web_search_call.action.sources"
+        ],
 
-            max_tool_calls=
-                MAX_WEB_SEARCH_CALLS,
+        reasoning={
+            "effort":
+                "none"
+        },
 
-            include=[
-                "web_search_call.action.sources"
-            ],
+        max_output_tokens=10000,
 
-            # Lunaの思考量を抑えて
-            # テスト時の料金と待ち時間を削減
-            reasoning={
-                "effort":
-                    "none"
+        text={
+            "format": {
+                "type":
+                    "json_schema",
+
+                "name":
+                    "research_trend_explorer",
+
+                "strict":
+                    True,
+
+                "schema":
+                    schema,
             },
 
-            max_output_tokens=
-                12000,
+            "verbosity":
+                "low",
+        },
 
-            text={
-                "format": {
-                    "type":
-                        "json_schema",
-
-                    "name":
-                        "research_trend_explorer",
-
-                    "strict":
-                        True,
-
-                    "schema":
-                        schema,
-                },
-
-                "verbosity":
-                    "low",
-            },
-
-            store=
-                False,
-        )
+        store=False,
     )
 
     if not response.output_text:
-
         raise RuntimeError(
-            "OpenAI APIから検索結果が返されませんでした。"
+            "The OpenAI API returned no response body."
         )
 
     try:
-
         data = json.loads(
             response.output_text
         )
-
     except json.JSONDecodeError as exc:
-
         raise RuntimeError(
-            f"OpenAI APIのJSON解析に失敗しました: {exc}"
+            f"Failed to parse OpenAI JSON output: {exc}"
         ) from exc
 
-
-    # ========================================================
-    # 基礎文献
-    # ========================================================
+    # --------------------------------------------------------
+    # Foundational papers
+    # --------------------------------------------------------
 
     foundational_papers = []
-
     rejected_papers = 0
 
     for paper in (
-        data.get(
-            "foundationalPapers"
-        )
+        data.get("foundationalPapers")
         or []
     ):
-
-        enriched = (
-            enrich_paper(
-                paper,
-                "foundational",
-            )
+        enriched = enrich_paper(
+            paper,
+            "foundational",
         )
 
         if enriched is None:
-
             rejected_papers += 1
             continue
 
@@ -1369,53 +984,49 @@ Established
             enriched
         )
 
-
-    # ========================================================
-    # Research Trends
-    # ========================================================
+    # --------------------------------------------------------
+    # Research trends
+    # --------------------------------------------------------
 
     research_trends = []
 
     for index, trend in enumerate(
-        data.get(
-            "researchTrends"
-        )
+        data.get("researchTrends")
         or [],
         start=1,
     ):
-
-        if not isinstance(
-            trend,
-            dict,
-        ):
+        if not isinstance(trend, dict):
             continue
 
-        clean_trend = dict(
-            trend
-        )
+        clean_trend = dict(trend)
 
         clean_trend["id"] = (
             f"trend_{index:02d}"
         )
 
+        # Existing frontend compatibility
+        clean_trend["nameEn"] = (
+            clean_trend.get("name")
+            or ""
+        )
+
+        clean_trend["nameJa"] = (
+            clean_trend.get("name")
+            or ""
+        )
+
         clean_papers = []
 
         for paper in (
-            trend.get(
-                "papers"
-            )
+            trend.get("papers")
             or []
         ):
-
-            enriched = (
-                enrich_paper(
-                    paper,
-                    "recent",
-                )
+            enriched = enrich_paper(
+                paper,
+                "recent",
             )
 
             if enriched is None:
-
                 rejected_papers += 1
                 continue
 
@@ -1423,87 +1034,64 @@ Established
                 enriched
             )
 
-        clean_trend[
-            "papers"
-        ] = clean_papers
+        clean_trend["papers"] = (
+            clean_papers
+        )
 
         research_trends.append(
             clean_trend
         )
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # Sources
-    # ========================================================
+    # --------------------------------------------------------
 
     all_sources = []
 
     all_sources.extend(
-        data.get(
-            "sources"
-        )
+        data.get("sources")
         or []
     )
 
-    for paper in (
-        foundational_papers
-    ):
-
+    for paper in foundational_papers:
         all_sources.extend(
-            paper.get(
-                "sources"
-            )
+            paper.get("sources")
             or []
         )
 
-    for trend in (
-        research_trends
-    ):
-
+    for trend in research_trends:
         for paper in (
-            trend.get(
-                "papers"
-            )
+            trend.get("papers")
             or []
         ):
-
             all_sources.extend(
-                paper.get(
-                    "sources"
-                )
+                paper.get("sources")
                 or []
             )
 
-    # OpenAI Web Search側のsourceも追加
     all_sources.extend(
         extract_web_search_sources(
             response
         )
     )
 
-    all_sources = (
-        deduplicate_sources(
-            all_sources
-        )
+    all_sources = deduplicate_sources(
+        all_sources
     )
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # Warnings
-    # ========================================================
+    # --------------------------------------------------------
 
     warnings = list(
-        data.get(
-            "warnings"
-        )
+        data.get("warnings")
         or []
     )
 
-    if rejected_papers > 0:
-
+    if rejected_papers:
         warnings.append(
-            f"書誌情報を十分に確認できなかった"
-            f"{rejected_papers}件の文献を除外しました。"
+            f"{rejected_papers} paper(s) were excluded because "
+            "their bibliographic information could not be validated."
         )
 
     if (
@@ -1511,12 +1099,9 @@ Established
         <
         foundational_count
     ):
-
         warnings.append(
-            f"基礎文献は指定"
-            f"{foundational_count}件のうち、"
-            f"確認できた"
-            f"{len(foundational_papers)}件を表示しています。"
+            f"Requested {foundational_count} foundational papers; "
+            f"{len(foundational_papers)} verified paper(s) are shown."
         )
 
     if (
@@ -1524,52 +1109,41 @@ Established
         <
         trend_count
     ):
-
         warnings.append(
-            f"研究潮流は指定"
-            f"{trend_count}件のうち、"
-            f"{len(research_trends)}件を表示しています。"
+            f"Requested {trend_count} research trends; "
+            f"{len(research_trends)} verified trend(s) are shown."
         )
 
+    keywords = (
+        data.get("keywords")
+        or []
+    )
 
-    # ========================================================
-    # Result
-    # ========================================================
+    normalized_topic = (
+        data.get("normalizedTopic")
+        or "Research topic"
+    )
 
     return {
-
         "querySummary": {
-
+            # Do not echo a Japanese query back into the UI.
+            # Keep visible output English-only.
             "originalQuery":
-                request.query,
+                normalized_topic,
 
             "normalizedTopic":
-                data.get(
-                    "normalizedTopic"
-                )
-                or
-                request.query.strip(),
+                normalized_topic,
 
+            # Existing frontend compatibility.
             "keywordsJa":
-                data.get(
-                    "keywordsJa"
-                )
-                or [],
+                [],
 
             "keywordsEn":
-                data.get(
-                    "keywordsEn"
-                )
-                or [],
+                keywords,
 
             "detectedField":
-                data.get(
-                    "detectedField"
-                )
-                or
-                request.field
-                or
-                "自動判定",
+                data.get("detectedField")
+                or field,
 
             "searchPeriod": {
                 "from":
@@ -1583,9 +1157,7 @@ Established
                 now.isoformat(),
 
             "modelSummary":
-                data.get(
-                    "modelSummary"
-                )
+                data.get("modelSummary")
                 or "",
         },
 
@@ -1602,7 +1174,6 @@ Established
             warnings,
 
         "searchMetadata": {
-
             "status":
                 "completed",
 
@@ -1625,9 +1196,7 @@ Established
             "recentPaperCount":
                 sum(
                     len(
-                        trend.get(
-                            "papers"
-                        )
+                        trend.get("papers")
                         or []
                     )
                     for trend
@@ -1641,16 +1210,227 @@ Established
 
 
 # ============================================================
+# English UI injection
+# ============================================================
+
+ENGLISH_UI_SCRIPT = r"""
+<script>
+(() => {
+  const translations = new Map([
+    ["研究テーマから、文献の入口を整理する",
+     "Navigate the Literature from a Research Topic"],
+
+    ["基礎文献・研究潮流・代表研究を、信頼性を重視して一目で確認できます。",
+     "Review foundational papers, research trends, and representative studies with a focus on reliability."],
+
+    ["研究テーマを入力",
+     "Enter a Research Topic"],
+
+    ["日本語・英語のキーワードを入れて、関連する研究の入口を探索できます。",
+     "Enter a keyword or research topic to explore relevant literature."],
+
+    ["研究テーマ",
+     "Research Topic"],
+
+    ["研究分野",
+     "Research Field"],
+
+    ["自動判定",
+     "Auto-detect"],
+
+    ["経済学・経営学",
+     "Economics and Management"],
+
+    ["社会科学",
+     "Social Sciences"],
+
+    ["工学",
+     "Engineering"],
+
+    ["情報科学",
+     "Computer and Information Science"],
+
+    ["環境科学",
+     "Environmental Science"],
+
+    ["医学・生命科学",
+     "Medicine and Life Sciences"],
+
+    ["人文科学",
+     "Humanities"],
+
+    ["その他",
+     "Other"],
+
+    ["研究テーマを探索",
+     "Explore Research Topic"],
+
+    ["検索IDを受け取りました",
+     "Search ID received"],
+
+    ["結果の取得を開始します…",
+     "Retrieving results..."],
+
+    ["結果の取得を開始します...",
+     "Retrieving results..."],
+
+    ["検索結果を整理しました",
+     "Search results ready"],
+
+    ["検索中にエラーが発生しました",
+     "An error occurred during the search"],
+
+    ["まだ基礎文献データはありません",
+     "No foundational papers yet"],
+
+    ["検索結果の中から、分野理解に重要な文献を整理します。",
+     "Important literature for understanding the field will appear here."],
+
+    ["まだ研究潮流データはありません",
+     "No research trends yet"],
+
+    ["現在注目されているテーマを、成熟度ごとに整理します。",
+     "Current research themes will appear here."],
+
+    ["分野:",
+     "Field:"],
+
+    ["検索期間:",
+     "Search period:"],
+
+    ["モデル要約はまだありません。",
+     "No research summary yet."]
+  ]);
+
+  function translateText(text) {
+    const trimmed = text.trim();
+
+    if (translations.has(trimmed)) {
+      return text.replace(
+        trimmed,
+        translations.get(trimmed)
+      );
+    }
+
+    return text;
+  }
+
+  function translateNode(root) {
+    const walker = document.createTreeWalker(
+      root,
+      NodeFilter.SHOW_TEXT
+    );
+
+    const nodes = [];
+
+    while (walker.nextNode()) {
+      nodes.push(walker.currentNode);
+    }
+
+    for (const node of nodes) {
+      const translated = translateText(
+        node.nodeValue || ""
+      );
+
+      if (translated !== node.nodeValue) {
+        node.nodeValue = translated;
+      }
+    }
+
+    if (root.querySelectorAll) {
+      for (const el of root.querySelectorAll(
+        "input, textarea"
+      )) {
+        if (
+          el.placeholder
+          &&
+          translations.has(
+            el.placeholder.trim()
+          )
+        ) {
+          el.placeholder = translations.get(
+            el.placeholder.trim()
+          );
+        }
+      }
+
+      for (const option of root.querySelectorAll(
+        "option"
+      )) {
+        const key = option.textContent.trim();
+
+        if (translations.has(key)) {
+          option.textContent = translations.get(
+            key
+          );
+        }
+      }
+    }
+  }
+
+  function run() {
+    translateNode(document.body);
+  }
+
+  document.addEventListener(
+    "DOMContentLoaded",
+    run
+  );
+
+  const observer = new MutationObserver(
+    () => run()
+  );
+
+  observer.observe(
+    document.documentElement,
+    {
+      childList: true,
+      subtree: true,
+      characterData: true
+    }
+  );
+})();
+</script>
+"""
+
+
+# ============================================================
 # Root
 # ============================================================
 
-@app.get("/")
-def read_root() -> FileResponse:
+@app.get(
+    "/",
+    response_class=HTMLResponse,
+)
+def read_root() -> HTMLResponse:
 
-    return FileResponse(
+    index_path = (
         STATIC_DIR
         /
         "index.html"
+    )
+
+    html = index_path.read_text(
+        encoding="utf-8"
+    )
+
+    if "</body>" in html:
+        html = html.replace(
+            "</body>",
+            ENGLISH_UI_SCRIPT
+            +
+            "¥n</body>",
+        )
+    else:
+        html += ENGLISH_UI_SCRIPT
+
+    return HTMLResponse(
+        content=html,
+        media_type="text/html",
+        headers={
+            "Content-Type":
+                "text/html; charset=utf-8"
+        },
     )
 
 
@@ -1671,12 +1451,8 @@ def create_search(
     )
 
     try:
-
-        # ----------------------------------------------------
-        # 現在のフロントがGETを1回しか行わないため、
-        # POST内で検索を最後まで完了させる。
-        # ----------------------------------------------------
-
+        # Run the complete research request here.
+        # The existing frontend only performs one GET after POST.
         result = research_topic(
             request
         )
@@ -1690,12 +1466,11 @@ def create_search(
         search_store[
             search_id
         ] = {
-
             "status":
                 "completed",
 
             "progress":
-                "検索結果を整理しました",
+                "Search results ready",
 
             "result":
                 result,
@@ -1705,22 +1480,20 @@ def create_search(
         }
 
     except Exception as exc:
-
         print(
             "SEARCH ERROR:",
             type(exc).__name__,
-            str(exc),
+            repr(str(exc)),
         )
 
         search_store[
             search_id
         ] = {
-
             "status":
                 "error",
 
             "progress":
-                "検索中にエラーが発生しました",
+                "An error occurred during the search",
 
             "result":
                 {},
@@ -1736,7 +1509,7 @@ def create_search(
 
 
 # ============================================================
-# Result
+# Search result
 # ============================================================
 
 @app.get(
@@ -1752,10 +1525,9 @@ def get_search(
     )
 
     if not item:
-
         raise HTTPException(
             status_code=404,
-            detail="search not found",
+            detail="Search not found",
         )
 
     return SearchStatusResponse(
@@ -1764,14 +1536,13 @@ def get_search(
 
 
 # ============================================================
-# Health Check
+# Health
 # ============================================================
 
 @app.get("/api/health")
 def health() -> dict:
 
     return {
-
         "ok":
             True,
 
@@ -1779,7 +1550,7 @@ def health() -> dict:
             get_openai_api_key()
             is not None,
 
-        "model":
+        "defaultModel":
             MODEL_NAME,
 
         "searchModel":
@@ -1787,4 +1558,7 @@ def health() -> dict:
 
         "maxWebSearchCalls":
             MAX_WEB_SEARCH_CALLS,
+
+        "outputLanguage":
+            "English",
     }
