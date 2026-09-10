@@ -1,6 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import json
@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 
+import httpx
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -22,20 +23,21 @@ from openai import OpenAI
 BASE_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BASE_DIR / "frontend"
 ENV_FILE = BASE_DIR / ".env"
+CACHE_DIR = BASE_DIR / ".search_cache"
 
 load_dotenv(ENV_FILE)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# JSON response
+# ASCII-safe JSON response
 # ============================================================
 
 class SafeJSONResponse(JSONResponse):
     """
-    Serialize non-ASCII characters as ¥¥uXXXX.
-    This makes the actual HTTP JSON payload ASCII-only and avoids
-    browser/terminal charset problems while JSON clients still receive
-    the correct Unicode values after parsing.
+    The HTTP JSON payload is serialized as ASCII-safe JSON (¥¥uXXXX).
+    Browsers still receive normal Unicode after JSON.parse(), but this
+    avoids character-set corruption in terminals/proxies.
     """
     media_type = "application/json; charset=utf-8"
 
@@ -100,6 +102,7 @@ SEARCH_MODEL_NAME = os.getenv(
     "gpt-5.6-luna",
 )
 
+# Keep this low during testing. Raise to 5-8 later if needed.
 MAX_WEB_SEARCH_CALLS = int(
     os.getenv(
         "OPENAI_MAX_WEB_SEARCH_CALLS",
@@ -137,7 +140,52 @@ def get_openai_client() -> OpenAI:
 
 
 # ============================================================
-# Input normalization
+# Repair incoming Japanese mojibake only
+# ============================================================
+
+MOJIBAKE_MARKERS = (
+    "蜴",
+    "繧",
+    "縺",
+    "譁",
+    "螳",
+    "逕",
+    "邨",
+    "謖",
+    "譬",
+    "菴",
+    "蜈",
+    "鬆",
+)
+
+
+def repair_mojibake(text: Optional[str]) -> str:
+    """
+    Repairs the typical UTF-8 -> CP932/Shift_JIS mojibake seen in the
+    previous runs, e.g. '蜴溷ｭ仙鴨' -> '原子力'.
+
+    Correct Japanese/English text is left unchanged in normal cases.
+    """
+    if not text:
+        return ""
+
+    if not any(marker in text for marker in MOJIBAKE_MARKERS):
+        return text
+
+    for encoding in ("cp932", "shift_jis"):
+        try:
+            candidate = text.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+
+        if candidate and candidate != text:
+            return candidate
+
+    return text
+
+
+# ============================================================
+# Field normalization
 # ============================================================
 
 FIELD_MAP = {
@@ -154,13 +202,16 @@ FIELD_MAP = {
 
 
 def normalize_field(field: Optional[str]) -> str:
+    field = repair_mojibake(field)
+
     if not field:
         return "Auto-detect"
+
     return FIELD_MAP.get(field, field)
 
 
 # ============================================================
-# Structured Output JSON schema
+# Structured Output schema
 # ============================================================
 
 def build_output_schema(
@@ -204,15 +255,12 @@ def build_output_schema(
         "properties": {
             "title": {
                 "type": "string",
-                "minLength": 1,
             },
             "authors": {
                 "type": "array",
                 "items": {
                     "type": "string",
-                    "minLength": 1,
                 },
-                "minItems": 1,
             },
             "year": {
                 "type": "integer",
@@ -221,7 +269,6 @@ def build_output_schema(
             },
             "venue": {
                 "type": "string",
-                "minLength": 1,
             },
             "publicationType": {
                 "type": "string",
@@ -247,7 +294,6 @@ def build_output_schema(
             "sources": {
                 "type": "array",
                 "items": source_schema,
-                "minItems": 1,
             },
         },
         "required": [
@@ -282,14 +328,12 @@ def build_output_schema(
                 "items": {
                     "type": "string",
                 },
-                "maxItems": 5,
             },
             "keywords": {
                 "type": "array",
                 "items": {
                     "type": "string",
                 },
-                "maxItems": 10,
             },
             "maturity": {
                 "type": "string",
@@ -302,7 +346,6 @@ def build_output_schema(
             "papers": {
                 "type": "array",
                 "items": paper_schema,
-                "maxItems": papers_per_trend,
             },
         },
         "required": [
@@ -328,7 +371,6 @@ def build_output_schema(
                 "items": {
                     "type": "string",
                 },
-                "maxItems": 12,
             },
             "detectedField": {
                 "type": "string",
@@ -339,12 +381,10 @@ def build_output_schema(
             "foundationalPapers": {
                 "type": "array",
                 "items": paper_schema,
-                "maxItems": foundational_count,
             },
             "researchTrends": {
                 "type": "array",
                 "items": trend_schema,
-                "maxItems": trend_count,
             },
             "sources": {
                 "type": "array",
@@ -376,10 +416,9 @@ def build_output_schema(
 # ============================================================
 
 def make_google_scholar_url(title: str) -> str:
-    query = f'"{title or ""}"'
     return (
         "https://scholar.google.com/scholar?q="
-        + quote_plus(query)
+        + quote_plus(f'"{title or ""}"')
     )
 
 
@@ -420,23 +459,9 @@ def make_citation_key(paper: dict) -> str:
     )
 
     stopwords = {
-        "a",
-        "an",
-        "the",
-        "of",
-        "and",
-        "or",
-        "for",
-        "to",
-        "in",
-        "on",
-        "with",
-        "from",
-        "by",
-        "at",
-        "as",
-        "is",
-        "are",
+        "a", "an", "the", "of", "and", "or", "for",
+        "to", "in", "on", "with", "from", "by", "at",
+        "as", "is", "are",
     }
 
     keyword = next(
@@ -451,7 +476,7 @@ def make_citation_key(paper: dict) -> str:
     return f"{surname}{year}{keyword}"
 
 
-def make_bibtex(paper: dict) -> str:
+def make_bibtex_fallback(paper: dict) -> str:
     authors = [
         author.strip()
         for author in (paper.get("authors") or [])
@@ -474,8 +499,42 @@ def make_bibtex(paper: dict) -> str:
         )
 
     lines.append("}")
-
     return "¥n".join(lines)
+
+
+def get_bibtex_from_doi(doi: Optional[str]) -> Optional[str]:
+    """
+    Try DOI content negotiation first.
+    This does not scrape Google Scholar and gives a more authoritative
+    BibTeX record when the DOI registration agency supports it.
+    """
+    if not doi:
+        return None
+
+    doi = doi.strip()
+    if not doi:
+        return None
+
+    try:
+        response = httpx.get(
+            f"https://doi.org/{doi}",
+            headers={
+                "Accept": "application/x-bibtex",
+                "User-Agent": "ResearchTrendExplorer/0.1",
+            },
+            follow_redirects=True,
+            timeout=12.0,
+        )
+
+        if response.status_code == 200:
+            text = response.text.strip()
+            if text.startswith("@"):
+                return text
+
+    except Exception:
+        pass
+
+    return None
 
 
 def is_valid_paper(paper: dict) -> bool:
@@ -486,12 +545,12 @@ def is_valid_paper(paper: dict) -> bool:
     if not isinstance(title, str) or not title.strip():
         return False
 
-    authors = paper.get("authors") or []
+    authors = paper.get("authors")
     if not isinstance(authors, list):
         return False
 
     valid_authors = [
-        author
+        author.strip()
         for author in authors
         if isinstance(author, str)
         and author.strip()
@@ -508,31 +567,23 @@ def is_valid_paper(paper: dict) -> bool:
     if not isinstance(venue, str) or not venue.strip():
         return False
 
-    sources = paper.get("sources") or []
+    sources = paper.get("sources")
     if not isinstance(sources, list):
         return False
 
-    valid_source_found = False
-
-    for source in sources:
-        if not isinstance(source, dict):
-            continue
-
-        url = source.get("url")
-
-        if (
-            isinstance(url, str)
-            and url.startswith(
-                (
-                    "https://",
-                    "http://",
-                )
+    valid_source = any(
+        isinstance(source, dict)
+        and isinstance(source.get("url"), str)
+        and source["url"].startswith(
+            (
+                "https://",
+                "http://",
             )
-        ):
-            valid_source_found = True
-            break
+        )
+        for source in sources
+    )
 
-    return valid_source_found
+    return valid_source
 
 
 def enrich_paper(
@@ -547,7 +598,7 @@ def enrich_paper(
 
     paper["authors"] = [
         author.strip()
-        for author in paper.get("authors", [])
+        for author in (paper.get("authors") or [])
         if isinstance(author, str)
         and author.strip()
     ]
@@ -555,7 +606,8 @@ def enrich_paper(
     paper["id"] = str(uuid.uuid4())
     paper["category"] = category
 
-    # Keep both names for compatibility with the existing frontend.
+    # Existing frontend compatibility:
+    # the old UI expects abstractJa even though all text is now English.
     paper["abstractJa"] = (
         paper.get("abstract")
         or
@@ -571,8 +623,14 @@ def enrich_paper(
         )
     )
 
-    paper["bibtex"] = make_bibtex(
-        paper
+    paper["bibtex"] = (
+        get_bibtex_from_doi(
+            paper.get("doi")
+        )
+        or
+        make_bibtex_fallback(
+            paper
+        )
     )
 
     doi_exists = bool(
@@ -590,14 +648,13 @@ def enrich_paper(
 
     abstract_exists = bool(
         abstract_text
-        and abstract_text
+        and
+        abstract_text
         !=
         "No publicly available abstract was verified."
     )
 
-    paper["verificationStatus"] = (
-        "verified"
-    )
+    paper["verificationStatus"] = "verified"
 
     paper["verification"] = {
         "status": "verified",
@@ -617,10 +674,7 @@ def enrich_paper(
 # Sources
 # ============================================================
 
-def deduplicate_sources(
-    sources: list,
-) -> list:
-
+def deduplicate_sources(sources: list) -> list:
     result = []
     seen_urls = set()
 
@@ -633,26 +687,25 @@ def deduplicate_sources(
             or ""
         ).strip()
 
-        if not url:
-            continue
-
-        if url in seen_urls:
+        if not url or url in seen_urls:
             continue
 
         seen_urls.add(url)
 
         source_title = source.get("title") or "Source"
-        if not isinstance(source_title, str) or not source_title.isascii():
+
+        # Keep the UI English-only. Do not display garbled/non-ASCII
+        # search-result titles; the URL remains available.
+        if (
+            not isinstance(source_title, str)
+            or not source_title.isascii()
+        ):
             source_title = "Source"
 
         result.append(
             {
-                "title":
-                    source_title,
-
-                "url":
-                    url,
-
+                "title": source_title,
+                "url": url,
                 "sourceType":
                     source.get("sourceType")
                     or "other",
@@ -662,10 +715,7 @@ def deduplicate_sources(
     return result
 
 
-def extract_web_search_sources(
-    response,
-) -> list:
-
+def extract_web_search_sources(response) -> list:
     try:
         payload = response.model_dump()
     except Exception:
@@ -706,20 +756,76 @@ def extract_web_search_sources(
 
             sources.append(
                 {
-                    "title":
-                        "Web source",
-
-                    "url":
-                        url,
-
-                    "sourceType":
-                        "other",
+                    "title": "Web source",
+                    "url": url,
+                    "sourceType": "other",
                 }
             )
 
     return deduplicate_sources(
         sources
     )
+
+
+# ============================================================
+# Disk cache
+# ============================================================
+
+def cache_path(search_id: str) -> Path:
+    safe_id = re.sub(
+        r"[^A-Za-z0-9_-]",
+        "",
+        search_id,
+    )
+    return CACHE_DIR / f"{safe_id}.json"
+
+
+def save_search(
+    search_id: str,
+    item: dict,
+) -> None:
+    try:
+        path = cache_path(search_id)
+        temporary = path.with_suffix(".tmp")
+
+        temporary.write_text(
+            json.dumps(
+                item,
+                ensure_ascii=True,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+
+        temporary.replace(path)
+
+    except Exception as exc:
+        print(
+            "CACHE WRITE WARNING:",
+            repr(exc),
+        )
+
+
+def load_search(
+    search_id: str,
+) -> Optional[dict]:
+    path = cache_path(search_id)
+
+    if not path.exists():
+        return None
+
+    try:
+        return json.loads(
+            path.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception as exc:
+        print(
+            "CACHE READ WARNING:",
+            repr(exc),
+        )
+        return None
 
 
 # ============================================================
@@ -731,6 +837,15 @@ def research_topic(
 ) -> dict:
 
     client = get_openai_client()
+
+    raw_query = repair_mojibake(
+        request.query
+    ).strip()
+
+    if not raw_query:
+        raise RuntimeError(
+            "The research query is empty."
+        )
 
     now = (
         datetime
@@ -793,7 +908,7 @@ def research_topic(
 You are a research literature discovery assistant.
 
 USER QUERY:
-{request.query}
+{raw_query}
 
 USER-SPECIFIED FIELD:
 {field}
@@ -806,33 +921,17 @@ SETTINGS:
 
 Use web search to investigate the topic.
 
-OUTPUT LANGUAGE RULE:
-EVERY human-readable text field in your JSON response MUST be in English.
+OUTPUT LANGUAGE:
+Every human-readable explanatory field in the JSON response must be English.
+The user query may be Japanese. Translate and normalize it internally.
 
-This includes:
-- normalizedTopic
-- keywords
-- detectedField
-- modelSummary
-- trend names
-- trend descriptions
-- research questions
-- importance explanations
-- warnings
-- source titles
-
-The user query may be Japanese or another language.
-Translate and normalize it internally, but return the topic in English.
-
-PAPER LANGUAGE RULE:
-Prefer papers with an official English bibliographic title.
-If a paper has no verifiable English bibliographic title, exclude it.
-Do not translate a paper title yourself.
+For papers, prefer records with an official English bibliographic title.
+Do not translate bibliographic titles yourself.
 
 BIBLIOGRAPHIC ACCURACY:
-Only return papers whose existence you verified on the web.
+Only return real academic publications whose existence you verified on the web.
 
-Never invent or infer:
+Never invent or guess:
 - paper title
 - authors
 - publication year
@@ -841,10 +940,10 @@ Never invent or infer:
 - paper URL
 
 Authors are mandatory.
-If you cannot verify at least one author, exclude the paper.
+If at least one author cannot be verified, exclude the paper.
 Never return an empty authors array.
 
-Use authoritative sources when possible:
+Prefer authoritative sources:
 - official publisher page
 - DOI page
 - Crossref
@@ -852,34 +951,33 @@ Use authoritative sources when possible:
 - arXiv
 - SSRN
 - RePEc
-- conference website
-- university or research institute repository
+- official conference site
+- university/research institute repository
 
 DOI:
 If a DOI cannot be verified, use null.
 Never fabricate a DOI.
 
 ABSTRACT:
-If you can verify a publicly available abstract, summarize it faithfully
-in concise English.
+If a publicly available abstract can be verified, summarize it faithfully
+and concisely in English.
 
-If no public abstract can be verified, set abstract exactly to:
-
+If not, set abstract exactly to:
 "No publicly available abstract was verified."
 
-Do not infer an abstract from the title.
+Do not infer an abstract from the paper title.
 
 FOUNDATIONAL PAPERS:
 Do not restrict foundational papers to {from_year}-{current_year}.
-Choose papers that are genuinely useful for understanding the formation,
-standard theories, standard methods, or key concepts of the field.
+Select papers important for the formation of the field, standard theories,
+standard methods, central concepts, or major later research.
 Do not simply choose recent papers.
 
 RESEARCH TRENDS:
 Use mainly literature from {from_year}-{current_year}.
-Identify genuine recurring research themes rather than isolated buzzwords.
-Use recent reviews, major journals, conferences, and relevant policy or
-societal developments where useful.
+Identify recurring research themes rather than isolated buzzwords.
+Use recent reviews, major journals/conferences, and relevant policy or
+societal developments when useful.
 
 Maturity must be one of:
 - Emerging
@@ -890,10 +988,10 @@ MODEL SUMMARY:
 Write a concise 100-180 word English overview of the research topic.
 
 SOURCES:
-Each paper must have at least one real web source used to verify its
+Each paper must include at least one real source URL used to verify its
 bibliographic information.
 
-If fewer verified papers are available than requested, return fewer papers.
+If fewer verified papers are available than requested, return fewer.
 Accuracy is more important than filling quotas.
 """
 
@@ -903,8 +1001,7 @@ Accuracy is more important than filling quotas.
 
         tools=[
             {
-                "type":
-                    "web_search"
+                "type": "web_search"
             }
         ],
 
@@ -918,29 +1015,19 @@ Accuracy is more important than filling quotas.
         ],
 
         reasoning={
-            "effort":
-                "none"
+            "effort": "none"
         },
 
         max_output_tokens=10000,
 
         text={
             "format": {
-                "type":
-                    "json_schema",
-
-                "name":
-                    "research_trend_explorer",
-
-                "strict":
-                    True,
-
-                "schema":
-                    schema,
+                "type": "json_schema",
+                "name": "research_trend_explorer",
+                "strict": True,
+                "schema": schema,
             },
-
-            "verbosity":
-                "low",
+            "verbosity": "low",
         },
 
         store=False,
@@ -984,6 +1071,9 @@ Accuracy is more important than filling quotas.
             enriched
         )
 
+        if len(foundational_papers) >= foundational_count:
+            break
+
     # --------------------------------------------------------
     # Research trends
     # --------------------------------------------------------
@@ -999,17 +1089,15 @@ Accuracy is more important than filling quotas.
             continue
 
         clean_trend = dict(trend)
-
         clean_trend["id"] = (
             f"trend_{index:02d}"
         )
 
-        # Existing frontend compatibility
+        # Existing frontend compatibility.
         clean_trend["nameEn"] = (
             clean_trend.get("name")
             or ""
         )
-
         clean_trend["nameJa"] = (
             clean_trend.get("name")
             or ""
@@ -1034,13 +1122,16 @@ Accuracy is more important than filling quotas.
                 enriched
             )
 
-        clean_trend["papers"] = (
-            clean_papers
-        )
+            if len(clean_papers) >= papers_per_trend:
+                break
 
+        clean_trend["papers"] = clean_papers
         research_trends.append(
             clean_trend
         )
+
+        if len(research_trends) >= trend_count:
+            break
 
     # --------------------------------------------------------
     # Sources
@@ -1083,15 +1174,20 @@ Accuracy is more important than filling quotas.
     # Warnings
     # --------------------------------------------------------
 
-    warnings = list(
-        data.get("warnings")
-        or []
-    )
+    warnings = [
+        warning
+        for warning in (
+            data.get("warnings")
+            or []
+        )
+        if isinstance(warning, str)
+        and warning.isascii()
+    ]
 
     if rejected_papers:
         warnings.append(
             f"{rejected_papers} paper(s) were excluded because "
-            "their bibliographic information could not be validated."
+            "their bibliographic information was incomplete."
         )
 
     if (
@@ -1111,23 +1207,26 @@ Accuracy is more important than filling quotas.
     ):
         warnings.append(
             f"Requested {trend_count} research trends; "
-            f"{len(research_trends)} verified trend(s) are shown."
+            f"{len(research_trends)} trend(s) are shown."
         )
-
-    keywords = (
-        data.get("keywords")
-        or []
-    )
 
     normalized_topic = (
         data.get("normalizedTopic")
-        or "Research topic"
+        or raw_query
     )
+
+    keywords = [
+        keyword
+        for keyword in (
+            data.get("keywords")
+            or []
+        )
+        if isinstance(keyword, str)
+    ]
 
     return {
         "querySummary": {
-            # Do not echo a Japanese query back into the UI.
-            # Keep visible output English-only.
+            # English-only visible output.
             "originalQuery":
                 normalized_topic,
 
@@ -1146,11 +1245,8 @@ Accuracy is more important than filling quotas.
                 or field,
 
             "searchPeriod": {
-                "from":
-                    from_year,
-
-                "to":
-                    current_year,
+                "from": from_year,
+                "to": current_year,
             },
 
             "executedAt":
@@ -1210,13 +1306,188 @@ Accuracy is more important than filling quotas.
 
 
 # ============================================================
-# English UI injection
+# UI patch injected from main.py only
 # ============================================================
 
-ENGLISH_UI_SCRIPT = r"""
+UI_PATCH = r"""
+<style>
+.rte-generated-results {
+  margin-top: 18px;
+}
+
+.rte-result-count {
+  margin: 0 0 16px;
+  font-size: 15px;
+  font-weight: 700;
+  color: #53657f;
+}
+
+.rte-paper-card {
+  border: 1px solid #d8e3f2;
+  border-radius: 16px;
+  padding: 18px;
+  margin: 14px 0;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 5px 18px rgba(25, 55, 95, 0.05);
+}
+
+.rte-paper-badge {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  border-radius: 999px;
+  padding: 5px 9px;
+  background: #e8f1ff;
+  color: #2366d1;
+  margin-bottom: 10px;
+}
+
+.rte-paper-title {
+  margin: 0 0 8px;
+  font-size: 18px;
+  line-height: 1.45;
+  color: #14233f;
+}
+
+.rte-meta {
+  margin: 3px 0;
+  color: #5d6e88;
+  font-size: 14px;
+}
+
+.rte-label {
+  margin: 14px 0 5px;
+  font-weight: 800;
+  color: #21314c;
+}
+
+.rte-body {
+  margin: 0;
+  line-height: 1.65;
+  color: #50627e;
+}
+
+.rte-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.rte-action {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+  border: 1px solid #c9d9ef;
+  border-radius: 9px;
+  padding: 8px 11px;
+  font-size: 13px;
+  font-weight: 700;
+  background: white;
+  color: #1e61c7;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.rte-trend-card {
+  border: 1px solid #d8e3f2;
+  border-radius: 16px;
+  margin: 14px 0;
+  background: rgba(255, 255, 255, 0.78);
+  overflow: hidden;
+}
+
+.rte-trend-card > summary {
+  cursor: pointer;
+  padding: 17px 18px;
+  font-weight: 800;
+  color: #14233f;
+  list-style: none;
+}
+
+.rte-trend-card > summary::-webkit-details-marker {
+  display: none;
+}
+
+.rte-trend-content {
+  padding: 0 18px 18px;
+}
+
+.rte-maturity {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  background: #eef3fa;
+  color: #53657f;
+  vertical-align: middle;
+}
+
+.rte-keywords {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.rte-keyword {
+  font-size: 12px;
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: #f1f5fb;
+  color: #53657f;
+}
+
+.rte-rq {
+  margin: 6px 0 0 20px;
+  color: #50627e;
+  line-height: 1.55;
+}
+
+.rte-warning {
+  border: 1px solid #ead7a1;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 8px 0;
+  background: #fffbef;
+  color: #6b5a2a;
+  font-size: 13px;
+}
+
+.rte-fallback {
+  max-width: 1200px;
+  margin: 24px auto;
+  padding: 24px;
+  border: 1px solid #d8e3f2;
+  border-radius: 18px;
+  background: white;
+}
+
+.rte-fallback h2 {
+  color: #14233f;
+}
+
+.rte-loading-note {
+  margin-top: 10px;
+  color: #53657f;
+  font-size: 13px;
+}
+</style>
+
 <script>
 (() => {
-  const translations = new Map([
+  "use strict";
+
+  const nativeFetch = window.fetch.bind(window);
+
+  let latestSearchId = null;
+  let latestResult = null;
+  let renderedSearchId = null;
+  let activeLoadId = null;
+
+  const staticTranslations = new Map([
     ["研究テーマから、文献の入口を整理する",
      "Navigate the Literature from a Research Topic"],
 
@@ -1274,11 +1545,17 @@ ENGLISH_UI_SCRIPT = r"""
     ["結果の取得を開始します...",
      "Retrieving results..."],
 
-    ["検索結果を整理しました",
-     "Search results ready"],
+    ["検索テーマ",
+     "Research Topic"],
 
-    ["検索中にエラーが発生しました",
-     "An error occurred during the search"],
+    ["分野:",
+     "Field:"],
+
+    ["検索期間:",
+     "Search period:"],
+
+    ["モデル要約はまだありません。",
+     "No research summary yet."],
 
     ["まだ基礎文献データはありません",
      "No foundational papers yet"],
@@ -1290,32 +1567,55 @@ ENGLISH_UI_SCRIPT = r"""
      "No research trends yet"],
 
     ["現在注目されているテーマを、成熟度ごとに整理します。",
-     "Current research themes will appear here."],
-
-    ["分野:",
-     "Field:"],
-
-    ["検索期間:",
-     "Search period:"],
-
-    ["モデル要約はまだありません。",
-     "No research summary yet."]
+     "Current research themes will appear here."]
   ]);
 
-  function translateText(text) {
-    const trimmed = text.trim();
 
-    if (translations.has(trimmed)) {
-      return text.replace(
+  function translateString(value) {
+    if (!value) {
+      return value;
+    }
+
+    const trimmed = value.trim();
+
+    if (staticTranslations.has(trimmed)) {
+      return value.replace(
         trimmed,
-        translations.get(trimmed)
+        staticTranslations.get(trimmed)
       );
     }
 
-    return text;
+    let match = trimmed.match(
+      /^(¥¥d+)¥¥s*件の基礎文献候補$/
+    );
+
+    if (match) {
+      return value.replace(
+        trimmed,
+        `${match[1]} foundational paper candidates`
+      );
+    }
+
+    match = trimmed.match(
+      /^(¥¥d+)¥¥s*件の研究潮流候補$/
+    );
+
+    if (match) {
+      return value.replace(
+        trimmed,
+        `${match[1]} research trend candidates`
+      );
+    }
+
+    return value;
   }
 
-  function translateNode(root) {
+
+  function translateUI(root = document.body) {
+    if (!root) {
+      return;
+    }
+
     const walker = document.createTreeWalker(
       root,
       NodeFilter.SHOW_TEXT
@@ -1328,70 +1628,1119 @@ ENGLISH_UI_SCRIPT = r"""
     }
 
     for (const node of nodes) {
-      const translated = translateText(
-        node.nodeValue || ""
+      const oldText = node.nodeValue || "";
+      const newText = translateString(oldText);
+
+      if (newText !== oldText) {
+        node.nodeValue = newText;
+      }
+    }
+
+    if (!root.querySelectorAll) {
+      return;
+    }
+
+    for (const option of root.querySelectorAll("option")) {
+      const oldText = option.textContent || "";
+      const newText = translateString(oldText);
+
+      if (newText !== oldText) {
+        option.textContent = newText;
+      }
+    }
+  }
+
+
+  function createElement(tag, className, text) {
+    const el = document.createElement(tag);
+
+    if (className) {
+      el.className = className;
+    }
+
+    if (
+      text !== undefined
+      &&
+      text !== null
+    ) {
+      el.textContent = String(text);
+    }
+
+    return el;
+  }
+
+
+  function findLeafWithExactText(text) {
+    const elements = document.querySelectorAll(
+      "h1,h2,h3,h4,h5,h6,p,span,strong,div"
+    );
+
+    for (const el of elements) {
+      if (
+        el.children.length === 0
+        &&
+        (el.textContent || "").trim() === text
+      ) {
+        return el;
+      }
+    }
+
+    return null;
+  }
+
+
+  function findSectionPanel(headingText, clues) {
+    const heading = findLeafWithExactText(
+      headingText
+    );
+
+    if (!heading) {
+      return null;
+    }
+
+    let node = heading.parentElement;
+
+    while (
+      node
+      &&
+      node !== document.body
+    ) {
+      const text = node.textContent || "";
+
+      if (
+        clues.some(
+          clue => text.includes(clue)
+        )
+        &&
+        node.getBoundingClientRect().width > 300
+      ) {
+        return node;
+      }
+
+      node = node.parentElement;
+    }
+
+    return (
+      heading.parentElement
+      ||
+      null
+    );
+  }
+
+
+  function hideLegacySectionText(panel, type) {
+    if (!panel) {
+      return;
+    }
+
+    const elements = panel.querySelectorAll(
+      "p,div,span"
+    );
+
+    for (const el of elements) {
+      if (
+        el.closest(".rte-generated-results")
+        ||
+        el.classList.contains("rte-generated-results")
+      ) {
+        continue;
+      }
+
+      if (el.children.length !== 0) {
+        continue;
+      }
+
+      const text = (el.textContent || "").trim();
+
+      if (type === "foundational") {
+        if (
+          text === "No foundational papers yet"
+          ||
+          text === "Important literature for understanding the field will appear here."
+          ||
+          /^¥¥d+¥¥s+foundational paper candidates$/.test(text)
+          ||
+          /^¥¥d+¥¥s*件の基礎文献候補$/.test(text)
+          ||
+          text === "検索結果の中から、分野理解に重要な文献を整理します。"
+        ) {
+          el.style.display = "none";
+        }
+      }
+
+      if (type === "trends") {
+        if (
+          text === "No research trends yet"
+          ||
+          text === "Current research themes will appear here."
+          ||
+          /^¥¥d+¥¥s+research trend candidates$/.test(text)
+          ||
+          /^¥¥d+¥¥s*件の研究潮流候補$/.test(text)
+          ||
+          text === "現在注目されているテーマを、成熟度ごとに整理します。"
+        ) {
+          el.style.display = "none";
+        }
+      }
+    }
+  }
+
+
+  function createActionLink(label, href) {
+    if (!href) {
+      return null;
+    }
+
+    const link = createElement(
+      "a",
+      "rte-action",
+      label
+    );
+
+    link.href = href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+
+    return link;
+  }
+
+
+  function renderPaperCard(paper, badgeText) {
+    const card = createElement(
+      "article",
+      "rte-paper-card"
+    );
+
+    card.appendChild(
+      createElement(
+        "div",
+        "rte-paper-badge",
+        badgeText
+      )
+    );
+
+    card.appendChild(
+      createElement(
+        "h3",
+        "rte-paper-title",
+        paper.title || "Untitled paper"
+      )
+    );
+
+    const authors = Array.isArray(paper.authors)
+      ? paper.authors.filter(Boolean).join(", ")
+      : "";
+
+    const authorYear = [
+      authors,
+      paper.year
+    ].filter(Boolean).join(" · ");
+
+    if (authorYear) {
+      card.appendChild(
+        createElement(
+          "p",
+          "rte-meta",
+          authorYear
+        )
+      );
+    }
+
+    if (paper.venue) {
+      card.appendChild(
+        createElement(
+          "p",
+          "rte-meta",
+          paper.venue
+        )
+      );
+    }
+
+    if (paper.doi) {
+      card.appendChild(
+        createElement(
+          "p",
+          "rte-meta",
+          `DOI: ${paper.doi}`
+        )
+      );
+    }
+
+    card.appendChild(
+      createElement(
+        "div",
+        "rte-label",
+        "Abstract / Summary"
+      )
+    );
+
+    card.appendChild(
+      createElement(
+        "p",
+        "rte-body",
+        paper.abstract
+        ||
+        paper.abstractJa
+        ||
+        "No publicly available abstract was verified."
+      )
+    );
+
+    card.appendChild(
+      createElement(
+        "div",
+        "rte-label",
+        "Why this paper matters"
+      )
+    );
+
+    card.appendChild(
+      createElement(
+        "p",
+        "rte-body",
+        paper.importanceReason
+        ||
+        "No explanation available."
+      )
+    );
+
+    const actions = createElement(
+      "div",
+      "rte-actions"
+    );
+
+    const publisher = createActionLink(
+      "Publisher / Paper",
+      paper.publisherUrl
+    );
+
+    if (publisher) {
+      actions.appendChild(publisher);
+    }
+
+    if (paper.doi) {
+      actions.appendChild(
+        createActionLink(
+          "DOI",
+          `https://doi.org/${paper.doi}`
+        )
+      );
+    }
+
+    const scholar = createActionLink(
+      "Google Scholar",
+      paper.googleScholarUrl
+    );
+
+    if (scholar) {
+      actions.appendChild(scholar);
+    }
+
+    if (paper.bibtex) {
+      const button = createElement(
+        "button",
+        "rte-action",
+        "Copy BibTeX"
       );
 
-      if (translated !== node.nodeValue) {
-        node.nodeValue = translated;
-      }
+      button.type = "button";
+
+      button.addEventListener(
+        "click",
+        async () => {
+          try {
+            await navigator.clipboard.writeText(
+              paper.bibtex
+            );
+
+            const oldText = button.textContent;
+            button.textContent = "Copied";
+
+            setTimeout(
+              () => {
+                button.textContent = oldText;
+              },
+              1200
+            );
+          } catch (error) {
+            console.error(
+              "BibTeX copy failed:",
+              error
+            );
+          }
+        }
+      );
+
+      actions.appendChild(button);
     }
 
-    if (root.querySelectorAll) {
-      for (const el of root.querySelectorAll(
-        "input, textarea"
-      )) {
-        if (
-          el.placeholder
-          &&
-          translations.has(
-            el.placeholder.trim()
+    card.appendChild(actions);
+
+    return card;
+  }
+
+
+  function renderFoundational(result) {
+    const papers = Array.isArray(
+      result.foundationalPapers
+    )
+      ? result.foundationalPapers
+      : [];
+
+    let panel = findSectionPanel(
+      "Foundational Papers",
+      [
+        "foundation",
+        "基礎文献"
+      ]
+    );
+
+    if (!panel) {
+      return false;
+    }
+
+    hideLegacySectionText(
+      panel,
+      "foundational"
+    );
+
+    const old = panel.querySelector(
+      ".rte-generated-results[data-section='foundational']"
+    );
+
+    if (old) {
+      old.remove();
+    }
+
+    const wrapper = createElement(
+      "div",
+      "rte-generated-results"
+    );
+
+    wrapper.dataset.section = "foundational";
+
+    wrapper.appendChild(
+      createElement(
+        "div",
+        "rte-result-count",
+        `${papers.length} foundational paper${papers.length === 1 ? "" : "s"} found`
+      )
+    );
+
+    if (!papers.length) {
+      wrapper.appendChild(
+        createElement(
+          "p",
+          "rte-body",
+          "No verified foundational papers were returned."
+        )
+      );
+    }
+
+    for (const paper of papers) {
+      wrapper.appendChild(
+        renderPaperCard(
+          paper,
+          "Foundational Paper"
+        )
+      );
+    }
+
+    panel.appendChild(wrapper);
+
+    return true;
+  }
+
+
+  function renderTrends(result) {
+    const trends = Array.isArray(
+      result.researchTrends
+    )
+      ? result.researchTrends
+      : [];
+
+    let panel = findSectionPanel(
+      "Research Trends",
+      [
+        "research trend",
+        "研究潮流"
+      ]
+    );
+
+    if (!panel) {
+      return false;
+    }
+
+    hideLegacySectionText(
+      panel,
+      "trends"
+    );
+
+    const old = panel.querySelector(
+      ".rte-generated-results[data-section='trends']"
+    );
+
+    if (old) {
+      old.remove();
+    }
+
+    const wrapper = createElement(
+      "div",
+      "rte-generated-results"
+    );
+
+    wrapper.dataset.section = "trends";
+
+    wrapper.appendChild(
+      createElement(
+        "div",
+        "rte-result-count",
+        `${trends.length} research trend${trends.length === 1 ? "" : "s"} found`
+      )
+    );
+
+    if (!trends.length) {
+      wrapper.appendChild(
+        createElement(
+          "p",
+          "rte-body",
+          "No research trends were returned."
+        )
+      );
+    }
+
+    for (const trend of trends) {
+      const details = createElement(
+        "details",
+        "rte-trend-card"
+      );
+
+      details.open = true;
+
+      const summary = createElement(
+        "summary",
+        "",
+        trend.name
+        ||
+        trend.nameEn
+        ||
+        trend.nameJa
+        ||
+        "Research trend"
+      );
+
+      if (trend.maturity) {
+        summary.appendChild(
+          createElement(
+            "span",
+            "rte-maturity",
+            trend.maturity
           )
-        ) {
-          el.placeholder = translations.get(
-            el.placeholder.trim()
+        );
+      }
+
+      details.appendChild(summary);
+
+      const content = createElement(
+        "div",
+        "rte-trend-content"
+      );
+
+      if (trend.description) {
+        content.appendChild(
+          createElement(
+            "p",
+            "rte-body",
+            trend.description
+          )
+        );
+      }
+
+      if (trend.whyImportantNow) {
+        content.appendChild(
+          createElement(
+            "div",
+            "rte-label",
+            "Why it matters now"
+          )
+        );
+
+        content.appendChild(
+          createElement(
+            "p",
+            "rte-body",
+            trend.whyImportantNow
+          )
+        );
+      }
+
+      if (
+        Array.isArray(trend.researchQuestions)
+        &&
+        trend.researchQuestions.length
+      ) {
+        content.appendChild(
+          createElement(
+            "div",
+            "rte-label",
+            "Key research questions"
+          )
+        );
+
+        const list = createElement(
+          "ul",
+          "rte-rq"
+        );
+
+        for (const question of trend.researchQuestions) {
+          list.appendChild(
+            createElement(
+              "li",
+              "",
+              question
+            )
+          );
+        }
+
+        content.appendChild(list);
+      }
+
+      if (
+        Array.isArray(trend.keywords)
+        &&
+        trend.keywords.length
+      ) {
+        const keywordRow = createElement(
+          "div",
+          "rte-keywords"
+        );
+
+        for (const keyword of trend.keywords) {
+          keywordRow.appendChild(
+            createElement(
+              "span",
+              "rte-keyword",
+              keyword
+            )
+          );
+        }
+
+        content.appendChild(keywordRow);
+      }
+
+      const papers = Array.isArray(trend.papers)
+        ? trend.papers
+        : [];
+
+      if (papers.length) {
+        content.appendChild(
+          createElement(
+            "div",
+            "rte-label",
+            "Representative papers"
+          )
+        );
+
+        for (const paper of papers) {
+          content.appendChild(
+            renderPaperCard(
+              paper,
+              "Representative Paper"
+            )
           );
         }
       }
 
-      for (const option of root.querySelectorAll(
-        "option"
-      )) {
-        const key = option.textContent.trim();
+      details.appendChild(content);
+      wrapper.appendChild(details);
+    }
 
-        if (translations.has(key)) {
-          option.textContent = translations.get(
-            key
-          );
-        }
+    panel.appendChild(wrapper);
+
+    return true;
+  }
+
+
+  function renderWarnings(result) {
+    const old = document.querySelector(
+      "#rte-global-warnings"
+    );
+
+    if (old) {
+      old.remove();
+    }
+
+    const warnings = Array.isArray(result.warnings)
+      ? result.warnings
+      : [];
+
+    if (!warnings.length) {
+      return;
+    }
+
+    const container = createElement(
+      "section",
+      "rte-fallback"
+    );
+
+    container.id = "rte-global-warnings";
+
+    container.appendChild(
+      createElement(
+        "h2",
+        "",
+        "Search Notes"
+      )
+    );
+
+    for (const warning of warnings) {
+      container.appendChild(
+        createElement(
+          "div",
+          "rte-warning",
+          warning
+        )
+      );
+    }
+
+    document.body.appendChild(container);
+  }
+
+
+  function renderFallback(result) {
+    let container = document.querySelector(
+      "#rte-fallback-results"
+    );
+
+    if (container) {
+      container.remove();
+    }
+
+    container = createElement(
+      "section",
+      "rte-fallback"
+    );
+
+    container.id = "rte-fallback-results";
+
+    container.appendChild(
+      createElement(
+        "h2",
+        "",
+        "Research Results"
+      )
+    );
+
+    const fp = createElement(
+      "div",
+      "rte-generated-results"
+    );
+
+    fp.appendChild(
+      createElement(
+        "h3",
+        "",
+        "Foundational Papers"
+      )
+    );
+
+    for (const paper of (result.foundationalPapers || [])) {
+      fp.appendChild(
+        renderPaperCard(
+          paper,
+          "Foundational Paper"
+        )
+      );
+    }
+
+    container.appendChild(fp);
+
+    const tr = createElement(
+      "div",
+      "rte-generated-results"
+    );
+
+    tr.appendChild(
+      createElement(
+        "h3",
+        "",
+        "Research Trends"
+      )
+    );
+
+    for (const trend of (result.researchTrends || [])) {
+      const details = createElement(
+        "details",
+        "rte-trend-card"
+      );
+
+      details.open = true;
+
+      const summary = createElement(
+        "summary",
+        "",
+        trend.name
+        ||
+        trend.nameEn
+        ||
+        trend.nameJa
+        ||
+        "Research trend"
+      );
+
+      details.appendChild(summary);
+
+      const content = createElement(
+        "div",
+        "rte-trend-content"
+      );
+
+      if (trend.description) {
+        content.appendChild(
+          createElement(
+            "p",
+            "rte-body",
+            trend.description
+          )
+        );
       }
+
+      for (const paper of (trend.papers || [])) {
+        content.appendChild(
+          renderPaperCard(
+            paper,
+            "Representative Paper"
+          )
+        );
+      }
+
+      details.appendChild(content);
+      tr.appendChild(details);
+    }
+
+    container.appendChild(tr);
+
+    document.body.appendChild(container);
+  }
+
+
+  function renderResult(result, searchId = null) {
+    if (!result) {
+      return;
+    }
+
+    latestResult = result;
+
+    translateUI();
+
+    const foundationalRendered = renderFoundational(
+      result
+    );
+
+    const trendsRendered = renderTrends(
+      result
+    );
+
+    if (
+      !foundationalRendered
+      ||
+      !trendsRendered
+    ) {
+      renderFallback(result);
+    } else {
+      const fallback = document.querySelector(
+        "#rte-fallback-results"
+      );
+
+      if (fallback) {
+        fallback.remove();
+      }
+    }
+
+    renderWarnings(result);
+
+    if (searchId) {
+      renderedSearchId = searchId;
+    }
+
+    console.log(
+      "Research Trend Explorer rendered result:",
+      {
+        searchId,
+        foundationalPapers:
+          (result.foundationalPapers || []).length,
+        researchTrends:
+          (result.researchTrends || []).length
+      }
+    );
+  }
+
+
+  async function loadSearchResult(searchId) {
+    if (
+      !searchId
+      ||
+      activeLoadId === searchId
+    ) {
+      return;
+    }
+
+    activeLoadId = searchId;
+
+    try {
+      const response = await nativeFetch(
+        `/api/search/${encodeURIComponent(searchId)}`,
+        {
+          cache: "no-store"
+        }
+      );
+
+      const payload = await response.json();
+
+      if (
+        payload
+        &&
+        payload.status === "completed"
+        &&
+        payload.result
+      ) {
+        latestSearchId = searchId;
+        renderResult(
+          payload.result,
+          searchId
+        );
+      }
+    } catch (error) {
+      console.error(
+        "Could not load research result:",
+        error
+      );
+    } finally {
+      activeLoadId = null;
     }
   }
 
-  function run() {
-    translateNode(document.body);
+
+  function scanSearchIdFromPage() {
+    const text = (
+      document.body
+      &&
+      document.body.innerText
+    )
+      || "";
+
+    const matches = text.match(
+      /[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/gi
+    );
+
+    if (
+      matches
+      &&
+      matches.length
+    ) {
+      return matches[
+        matches.length - 1
+      ];
+    }
+
+    return null;
   }
+
+
+  async function refreshFromVisibleSearchId() {
+    const id = scanSearchIdFromPage();
+
+    if (
+      !id
+      ||
+      id === renderedSearchId
+    ) {
+      return;
+    }
+
+    await loadSearchResult(id);
+  }
+
+
+  // ----------------------------------------------------------
+  // Intercept existing app.js fetch calls.
+  // This captures the search ID even if the page text changes.
+  // ----------------------------------------------------------
+
+  window.fetch = async function(...args) {
+    const response = await nativeFetch(...args);
+
+    try {
+      const requestUrl =
+        typeof args[0] === "string"
+          ? args[0]
+          : (
+              args[0]
+              &&
+              args[0].url
+            )
+            || "";
+
+      const method =
+        (
+          args[1]
+          &&
+          args[1].method
+        )
+        ||
+        (
+          args[0]
+          &&
+          args[0].method
+        )
+        ||
+        "GET";
+
+      if (
+        method.toUpperCase() === "POST"
+        &&
+        /¥/api¥/search¥/?$/.test(requestUrl)
+      ) {
+        response.clone().json()
+          .then(payload => {
+            if (
+              payload
+              &&
+              payload.searchId
+            ) {
+              latestSearchId = payload.searchId;
+
+              setTimeout(
+                () => loadSearchResult(
+                  payload.searchId
+                ),
+                50
+              );
+            }
+          })
+          .catch(() => {});
+      }
+
+      if (
+        method.toUpperCase() === "GET"
+        &&
+        /¥/api¥/search¥/[^/?#]+/.test(requestUrl)
+      ) {
+        response.clone().json()
+          .then(payload => {
+            if (
+              payload
+              &&
+              payload.status === "completed"
+              &&
+              payload.result
+            ) {
+              const parts = requestUrl.split("/");
+              const id = parts[parts.length - 1];
+
+              latestSearchId = id;
+
+              setTimeout(
+                () => renderResult(
+                  payload.result,
+                  id
+                ),
+                50
+              );
+
+              setTimeout(
+                () => renderResult(
+                  payload.result,
+                  id
+                ),
+                350
+              );
+            }
+          })
+          .catch(() => {});
+      }
+    } catch (error) {
+      console.error(
+        "Fetch hook error:",
+        error
+      );
+    }
+
+    return response;
+  };
+
+
+  // ----------------------------------------------------------
+  // Mutation / timer fallback.
+  // Even if the existing app.js behaves unexpectedly, the visible
+  // UUID is detected and the already-completed local API result is
+  // loaded without calling OpenAI again.
+  // ----------------------------------------------------------
+
+  let observerTimer = null;
+
+  const observer = new MutationObserver(
+    () => {
+      translateUI();
+
+      clearTimeout(observerTimer);
+
+      observerTimer = setTimeout(
+        () => {
+          refreshFromVisibleSearchId();
+
+          if (
+            latestResult
+            &&
+            (
+              !document.querySelector(
+                ".rte-generated-results[data-section='foundational']"
+              )
+              ||
+              !document.querySelector(
+                ".rte-generated-results[data-section='trends']"
+              )
+            )
+          ) {
+            renderResult(
+              latestResult,
+              latestSearchId
+            );
+          }
+        },
+        120
+      );
+    }
+  );
+
 
   document.addEventListener(
     "DOMContentLoaded",
-    run
-  );
+    () => {
+      translateUI();
 
-  const observer = new MutationObserver(
-    () => run()
-  );
+      observer.observe(
+        document.body,
+        {
+          childList: true,
+          subtree: true,
+          characterData: true
+        }
+      );
 
-  observer.observe(
-    document.documentElement,
-    {
-      childList: true,
-      subtree: true,
-      characterData: true
+      refreshFromVisibleSearchId();
+
+      setInterval(
+        refreshFromVisibleSearchId,
+        1000
+      );
     }
   );
 })();
 </script>
 """
+
 
 
 # ============================================================
@@ -1417,16 +2766,15 @@ def read_root() -> HTMLResponse:
     if "</body>" in html:
         html = html.replace(
             "</body>",
-            ENGLISH_UI_SCRIPT
+            UI_PATCH
             +
             "¥n</body>",
         )
     else:
-        html += ENGLISH_UI_SCRIPT
+        html += UI_PATCH
 
     return HTMLResponse(
         content=html,
-        media_type="text/html",
         headers={
             "Content-Type":
                 "text/html; charset=utf-8"
@@ -1451,8 +2799,8 @@ def create_search(
     )
 
     try:
-        # Run the complete research request here.
-        # The existing frontend only performs one GET after POST.
+        # The current frontend performs only one GET after POST.
+        # Complete the API research request before returning searchId.
         result = research_topic(
             request
         )
@@ -1463,9 +2811,7 @@ def create_search(
             "searchId"
         ] = search_id
 
-        search_store[
-            search_id
-        ] = {
+        item = {
             "status":
                 "completed",
 
@@ -1479,6 +2825,15 @@ def create_search(
                 None,
         }
 
+        search_store[
+            search_id
+        ] = item
+
+        save_search(
+            search_id,
+            item,
+        )
+
     except Exception as exc:
         print(
             "SEARCH ERROR:",
@@ -1486,9 +2841,7 @@ def create_search(
             repr(str(exc)),
         )
 
-        search_store[
-            search_id
-        ] = {
+        item = {
             "status":
                 "error",
 
@@ -1501,6 +2854,15 @@ def create_search(
             "error":
                 str(exc),
         }
+
+        search_store[
+            search_id
+        ] = item
+
+        save_search(
+            search_id,
+            item,
+        )
 
     return {
         "searchId":
@@ -1524,10 +2886,27 @@ def get_search(
         search_id
     )
 
-    if not item:
-        raise HTTPException(
-            status_code=404,
-            detail="Search not found",
+    # Recover searches after uvicorn restart.
+    if item is None:
+        item = load_search(
+            search_id
+        )
+
+        if item is not None:
+            search_store[
+                search_id
+            ] = item
+
+    # Do not return HTTP 404 for an old browser-stored ID.
+    if item is None:
+        return SearchStatusResponse(
+            status="error",
+            progress="Search result unavailable",
+            result={},
+            error=(
+                "This search ID is no longer available. "
+                "Please start a new search."
+            ),
         )
 
     return SearchStatusResponse(
@@ -1561,4 +2940,10 @@ def health() -> dict:
 
         "outputLanguage":
             "English",
+
+        "persistentSearchCache":
+            True,
+
+        "frontendRendererPatch":
+            True,
     }
